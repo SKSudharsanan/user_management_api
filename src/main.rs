@@ -4,7 +4,7 @@ use diesel::r2d2::{self, ConnectionManager};
 use dotenv::dotenv;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::fmt;
+use thiserror::Error;
 
 mod schema;
 use schema::users;
@@ -26,49 +26,27 @@ struct NewUser {
     email: String,
 }
 
-#[derive(Debug)]
-enum ApiError {
-    DbError(diesel::result::Error),
-    PoolError(r2d2::PoolError),
-    BlockingError(actix_web::error::BlockingError),
+#[derive(Error, Debug)]
+enum MyError {
+    #[error("Database error: {0}")]
+    DbError(#[from] diesel::result::Error),
+    #[error("Environment error: {0}")]
+    EnvError(#[from] std::env::VarError),
+    #[error("IO error: {0}")]
+    IOError(#[from] std::io::Error),
+    #[error("Blocking error: {0}")]
+    BlockingError(#[from] actix_web::error::BlockingError),
 }
 
-impl fmt::Display for ApiError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ApiError::DbError(e) => write!(f, "Database error: {}", e),
-            ApiError::PoolError(e) => write!(f, "Pool error: {}", e),
-            ApiError::BlockingError(e) => write!(f, "Blocking error: {}", e),
-        }
-    }
-}
-
-impl ResponseError for ApiError {
+impl ResponseError for MyError {
     fn error_response(&self) -> HttpResponse {
         HttpResponse::InternalServerError().json(format!("Internal Server Error: {}", self))
     }
 }
 
-impl From<diesel::result::Error> for ApiError {
-    fn from(error: diesel::result::Error) -> Self {
-        ApiError::DbError(error)
-    }
-}
+async fn create_user(pool: web::Data<DbPool>, new_user: web::Json<NewUser>) -> Result<HttpResponse, MyError> {
+    let mut conn = pool.get().expect("couldn't get db connection from pool");
 
-impl From<r2d2::PoolError> for ApiError {
-    fn from(error: r2d2::PoolError) -> Self {
-        ApiError::PoolError(error)
-    }
-}
-
-impl From<actix_web::error::BlockingError> for ApiError {
-    fn from(error: actix_web::error::BlockingError) -> Self {
-        ApiError::BlockingError(error)
-    }
-}
-
-async fn create_user(pool: web::Data<DbPool>, new_user: web::Json<NewUser>) -> Result<HttpResponse, ApiError> {
-    let mut conn = pool.get()?;
     let user = web::block(move || {
         diesel::insert_into(users::table)
             .values(new_user.into_inner())
@@ -79,12 +57,11 @@ async fn create_user(pool: web::Data<DbPool>, new_user: web::Json<NewUser>) -> R
     Ok(HttpResponse::Ok().json(user))
 }
 
-async fn get_user(pool: web::Data<DbPool>, user_id: web::Path<i32>) -> Result<HttpResponse, ApiError> {
-    let mut conn = pool.get()?;
-    let user = web::block(move || {
-        users::table.find(user_id.into_inner()).first::<User>(&mut conn)
-    })
-    .await??;
+async fn get_user(pool: web::Data<DbPool>, user_id: web::Path<i32>) -> Result<HttpResponse, MyError> {
+    let mut conn = pool.get().expect("couldn't get db connection from pool");
+
+    let user = web::block(move || users::table.find(user_id.into_inner()).first::<User>(&mut conn))
+        .await??;
 
     Ok(HttpResponse::Ok().json(user))
 }
@@ -93,8 +70,9 @@ async fn update_user(
     pool: web::Data<DbPool>,
     user_id: web::Path<i32>,
     updated_user: web::Json<NewUser>,
-) -> Result<HttpResponse, ApiError> {
-    let mut conn = pool.get()?;
+) -> Result<HttpResponse, MyError> {
+    let mut conn = pool.get().expect("couldn't get db connection from pool");
+
     let user = web::block(move || {
         diesel::update(users::table.find(user_id.into_inner()))
             .set(updated_user.into_inner())
@@ -105,8 +83,9 @@ async fn update_user(
     Ok(HttpResponse::Ok().json(user))
 }
 
-async fn delete_user(pool: web::Data<DbPool>, user_id: web::Path<i32>) -> Result<HttpResponse, ApiError> {
-    let mut conn = pool.get()?;
+async fn delete_user(pool: web::Data<DbPool>, user_id: web::Path<i32>) -> Result<HttpResponse, MyError> {
+    let mut conn = pool.get().expect("couldn't get db connection from pool");
+
     let deleted = web::block(move || {
         diesel::delete(users::table.find(user_id.into_inner())).execute(&mut conn)
     })
@@ -120,11 +99,11 @@ async fn delete_user(pool: web::Data<DbPool>, user_id: web::Path<i32>) -> Result
 }
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> Result<(), MyError> {
     dotenv().ok();
     env_logger::init();
 
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let database_url = env::var("DATABASE_URL")?;
     let manager = ConnectionManager::<PgConnection>::new(database_url);
     let pool = r2d2::Pool::builder()
         .build(manager)
@@ -140,5 +119,7 @@ async fn main() -> std::io::Result<()> {
     })
     .bind("127.0.0.1:8080")?
     .run()
-    .await
+    .await?;
+
+    Ok(())
 }
